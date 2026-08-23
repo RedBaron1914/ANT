@@ -1,0 +1,9 @@
+/target
+*.ant
+*.bin
+combine_src.py
+combined_sources.txt
+datasets/
+ant_config.toml
+tokenizer.json
+TECHNICAL_ROADMAP.md

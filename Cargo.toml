@@ -1,0 +1,23 @@
+[package]
+name = "ANTsmth"
+version = "0.8.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.0"
+memmap2 = "0.9.10"
+parking_lot = "0.12.5"
+paste = "1.0.15"
+rand = "0.8.5"
+tokio = { version = "1.52.3", features = ["full"] }
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system", "nvrtc", "cublas"] }
+indicatif = "0.17"
+faer = "0.21"
+rayon = "1.10"
+tokenizers = "0.20"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
