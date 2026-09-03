@@ -193,6 +193,9 @@ enum Commands {
     
     /// Run memory consolidation and deduplication (sleep phase)
     Sleep,
+
+    /// Run full neural integrity and diagnostic test suite
+    Test,
 }
 
 #[tokio::main]
@@ -335,6 +338,10 @@ async fn main() {
 
             trainer.sleep_phase(&dataset, config.training.seq_len, 10);
             trainer.pipeline.save_weights(&config.training.model_path).unwrap();
+        }
+
+        Commands::Test => {
+            crate::ant_core::sanity_check::run_full_diagnostics(&config);
         }
     }
 }

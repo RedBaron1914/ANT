@@ -11,3 +11,4 @@ pub mod ewc;
 pub mod readout;
 pub mod rmsnorm;
 pub mod session_tape;
+pub mod sanity_check;
