@@ -69,7 +69,7 @@ impl MinGRU {
 
     pub fn forward_with_cache(&mut self, input: &BatchTensor, cache: &mut MinGruScratchpad) {
         let h_size = self.hidden_state.data.ncols();
-        let b_size = self.hidden_state.data.nrows();
+        let b_size = input.data.nrows();
         
         cache.x.data.copy_from(&input.data);
         cache.prev_h.data.copy_from(&self.hidden_state.data);
@@ -324,10 +324,11 @@ impl GatedDeltaNet2 {
                 let k_val = k.data.read(batch_idx, i);
                 for j in 0..d {
                     let s_val = self.state[s_offset + i * d + j];
-                    let mut val = alpha_t[i] * s_val - k_val * row_vec[j] + k_val * w_t[j] * v.data.read(batch_idx, j);
-                    if val > 5.0 { val = 5.0; }
-                    if val < -5.0 { val = -5.0; }
-                    next_state[s_offset + i * d + j] = val;
+                    let val = alpha_t[i] * s_val - k_val * row_vec[j] + k_val * w_t[j] * v.data.read(batch_idx, j);
+                    let c = 5.0f32;
+                    let s_ratio = val / c;
+                    let s_sat = val / (1.0 + s_ratio * s_ratio).sqrt();
+                    next_state[s_offset + i * d + j] = s_sat;
                 }
             }
             
@@ -340,7 +341,99 @@ impl GatedDeltaNet2 {
             }
         }
         
-        self.state = next_state;
+        if self.state.len() < b_size * d * d {
+            self.state.resize(b_size * d * d, 0.0);
+        }
+        for (idx, &val) in next_state.iter().enumerate() {
+            self.state[idx] = val;
+        }
+    }
+
+    /// Read-only forward projection through frozen associative state S_{t-1} without state mutation
+    pub fn forward_step_readonly(&self, input: &BatchTensor, _negation_token_encountered: bool, out: &mut BatchTensor) {
+        let b_size = input.data.nrows();
+        let d = self.hidden_size;
+        
+        let mut q = BatchTensor::new(b_size, d);
+        self.w_q.matmul_batch(input, &mut q);
+        
+        for batch_idx in 0..b_size {
+            let s_offset = batch_idx * d * d;
+            for i in 0..d {
+                let mut sum = 0.0;
+                for j in 0..d {
+                    sum += self.state[s_offset + i * d + j] * q.data.read(batch_idx, j);
+                }
+                out.data.write(batch_idx, i, sum);
+            }
+        }
+    }
+
+    /// Commit single associative state update S_t from converged thought vector
+    pub fn commit_state_step(&mut self, input: &BatchTensor, negation_token_encountered: bool) {
+        let b_size = input.data.nrows();
+        let d = self.hidden_size;
+        
+        let mut k = BatchTensor::new(b_size, d);
+        let mut v = BatchTensor::new(b_size, d);
+        let mut b_gate = BatchTensor::new(b_size, d);
+        let mut w = BatchTensor::new(b_size, d);
+        let mut alpha = BatchTensor::new(b_size, d);
+        
+        self.w_k.matmul_batch(input, &mut k);
+        self.w_v.matmul_batch(input, &mut v);
+        self.w_b.matmul_batch(input, &mut b_gate);
+        self.w_w.matmul_batch(input, &mut w);
+        self.w_alpha.matmul_batch(input, &mut alpha);
+        
+        let mut next_state = vec![0.0; b_size * d * d];
+        
+        for batch_idx in 0..b_size {
+            let s_offset = batch_idx * d * d;
+            
+            let mut alpha_t = vec![0.0; d];
+            let mut b_t = vec![0.0; d];
+            let mut w_t = vec![0.0; d];
+            for i in 0..d {
+                alpha_t[i] = 1.0 / (1.0 + (-alpha.data.read(batch_idx, i)).exp());
+                let mut b_val = 1.0 / (1.0 + (-b_gate.data.read(batch_idx, i)).exp());
+                if negation_token_encountered {
+                    let k_val = k.data.read(batch_idx, i);
+                    b_val = b_val + (1.0 - b_val) * k_val.abs().tanh();
+                }
+                b_t[i] = b_val;
+                w_t[i] = 1.0 / (1.0 + (-w.data.read(batch_idx, i)).exp());
+            }
+            
+            let mut row_vec = vec![0.0; d];
+            for j in 0..d {
+                let mut sum = 0.0;
+                for m in 0..d {
+                    let s_val = self.state[s_offset + m * d + j];
+                    sum += b_t[m] * k.data.read(batch_idx, m) * alpha_t[m] * s_val;
+                }
+                row_vec[j] = sum;
+            }
+            
+            for i in 0..d {
+                let k_val = k.data.read(batch_idx, i);
+                for j in 0..d {
+                    let s_val = self.state[s_offset + i * d + j];
+                    let val = alpha_t[i] * s_val - k_val * row_vec[j] + k_val * w_t[j] * v.data.read(batch_idx, j);
+                    let c = 5.0f32;
+                    let s_ratio = val / c;
+                    let s_sat = val / (1.0 + s_ratio * s_ratio).sqrt();
+                    next_state[s_offset + i * d + j] = s_sat;
+                }
+            }
+        }
+        
+        if self.state.len() < b_size * d * d {
+            self.state.resize(b_size * d * d, 0.0);
+        }
+        for (idx, &val) in next_state.iter().enumerate() {
+            self.state[idx] = val;
+        }
     }
 
     pub fn forward_with_cache(&mut self, input: &BatchTensor, negation_token_encountered: bool, cache: &mut GatedDeltaNet2Scratchpad) {
@@ -411,10 +504,11 @@ impl GatedDeltaNet2 {
                 let k_val = k_t[i];
                 for j in 0..d {
                     let s_val = cache.S_prev[s_offset + i * d + j];
-                    let mut val = alpha_t[i] * s_val - k_val * row_vec[j] + k_val * w_t[j] * v_t[j];
-                    if val > 5.0 { val = 5.0; }
-                    if val < -5.0 { val = -5.0; }
-                    next_state[s_offset + i * d + j] = val;
+                    let val = alpha_t[i] * s_val - k_val * row_vec[j] + k_val * w_t[j] * v_t[j];
+                    let c = 5.0f32;
+                    let s_ratio = val / c;
+                    let s_sat = val / (1.0 + s_ratio * s_ratio).sqrt();
+                    next_state[s_offset + i * d + j] = s_sat;
                 }
             }
             

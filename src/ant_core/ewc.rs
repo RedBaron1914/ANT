@@ -190,6 +190,27 @@ impl LoraLinear {
     pub fn randomize(&mut self, min: f32, max: f32) {
         self.base.randomize(min, max);
     }
+
+    /// Merges adapter low-rank deltas (alpha/r * B * A) into base weights and resets low-rank factors
+    pub fn merge_into_base(&mut self) {
+        if self.rank == 0 { return; }
+        let scaling = self.alpha / self.rank as f32;
+        let rows = self.base.rows;
+        let cols = self.base.cols;
+
+        for i in 0..rows {
+            for j in 0..cols {
+                let mut delta = 0.0f32;
+                for r in 0..self.rank {
+                    delta += self.lora_b.data[i * self.lora_b.cols + r] * self.lora_a.data[r * self.lora_a.cols + j];
+                }
+                self.base.data[i * cols + j] += scaling * delta;
+            }
+        }
+
+        self.lora_a.randomize(-0.1, 0.1);
+        self.lora_b.data.fill(0.0);
+    }
     
     pub fn forward(&self, input: &BatchTensor, out: &mut BatchTensor, scratch: &mut LoraScratchpad) {
         self.base.matmul_batch(input, out);

@@ -62,6 +62,9 @@ pub struct MemoryAttention {
 }
 
 const USER_MEM_FLAG: usize = 1 << 60;
+const PACK_MEM_FLAG: usize = 1 << 61;
+const PACK_IDX_SHIFT: usize = 48;
+const MEM_IDX_MASK: usize = (1 << 48) - 1;
 
 impl MemoryAttention {
     pub fn new(key_dim: usize, hidden_dim: usize, top_k_base: usize, top_k_user: usize, lora_rank: usize, lora_alpha: f32) -> Self {
@@ -91,6 +94,7 @@ impl MemoryAttention {
         hidden_raw: &BatchTensor,
         base_memory: &DiskKVMemory,
         user_memory: &DiskKVMemory,
+        mounted_packs: &[DiskKVMemory],
         query_metadata: u64,
         cache: &mut MemoryAttentionCache,
     ) -> BatchTensor {
@@ -126,7 +130,7 @@ impl MemoryAttention {
             let mut q_slice = Tensor1D::new(self.key_dim);
             for i in 0..self.key_dim { q_slice.data[i] = cache.query.data.read(b, i); }
             
-            // 2. Dual-Memory lookup
+            // 2. Dual-Memory + Mounted Packs lookup
             let (_, base_indices) = base_memory.lookup(&q_slice, query_metadata, self.top_k_base);
             let (_, user_indices) = user_memory.lookup(&q_slice, query_metadata, self.top_k_user);
             
@@ -150,6 +154,20 @@ impl MemoryAttention {
                     dot -= 0.5;
                 }
                 candidates.push((idx | USER_MEM_FLAG, dot * scale));
+            }
+            for (p_idx, pack) in mounted_packs.iter().enumerate() {
+                let (_, pack_indices) = pack.lookup(&q_slice, query_metadata, self.top_k_base);
+                for &idx in &pack_indices {
+                    let key = pack.get_key(idx);
+                    let mut dot = 0.0;
+                    for j in 0..self.key_dim { dot += q_slice.data[j] * key[j]; }
+                    let polarity = pack.get_metadata(idx) & 1;
+                    if query_polarity != polarity {
+                        dot -= 0.5;
+                    }
+                    let encoded = PACK_MEM_FLAG | ((p_idx & 0x1FFF) << PACK_IDX_SHIFT) | (idx & MEM_IDX_MASK);
+                    candidates.push((encoded, dot * scale));
+                }
             }
 
             // Sort descending by score
@@ -222,7 +240,11 @@ impl MemoryAttention {
 
             // 5. Weighted sum over memory values
             for (i, &idx) in cache.top_k_indices[b].iter().enumerate() {
-                let val = if (idx & USER_MEM_FLAG) != 0 {
+                let val = if (idx & PACK_MEM_FLAG) != 0 {
+                    let p_idx = (idx & !PACK_MEM_FLAG) >> PACK_IDX_SHIFT;
+                    let m_idx = idx & MEM_IDX_MASK;
+                    mounted_packs[p_idx].get_val(m_idx)
+                } else if (idx & USER_MEM_FLAG) != 0 {
                     user_memory.get_val(idx & !USER_MEM_FLAG)
                 } else {
                     base_memory.get_val(idx)
@@ -247,8 +269,11 @@ impl MemoryAttention {
                 fused_h.data.write(b, i, hidden_raw.data.read(b, i) + fuse_in.data.read(b, i) + self.b_fuse.data[i]);
             }
         }
-
-        cache.prev_fused_h.data.copy_from(&fused_h.data);
+        for b in 0..b_size {
+            for i in 0..self.hidden_dim {
+                cache.prev_fused_h.data.write(b, i, fused_h.data.read(b, i));
+            }
+        }
 
         fused_h
     }
@@ -259,6 +284,7 @@ impl MemoryAttention {
         d_fused: &BatchTensor,
         base_memory: &DiskKVMemory,
         user_memory: &DiskKVMemory,
+        mounted_packs: &[DiskKVMemory],
         cache: &'a mut MemoryAttentionCache,
         grad_hidden_raw: &mut BatchTensor,
     ) -> &'a BatchTensor {
@@ -308,7 +334,11 @@ impl MemoryAttention {
             // 2. Gradient through weighted sum: mem_out = sum(alpha[i] * val[i])
             let mut d_alpha = vec![0.0; k];
             for (i, &idx) in cache.top_k_indices[b].iter().enumerate() {
-                let val = if (idx & USER_MEM_FLAG) != 0 {
+                let val = if (idx & PACK_MEM_FLAG) != 0 {
+                    let p_idx = (idx & !PACK_MEM_FLAG) >> PACK_IDX_SHIFT;
+                    let m_idx = idx & MEM_IDX_MASK;
+                    mounted_packs[p_idx].get_val(m_idx)
+                } else if (idx & USER_MEM_FLAG) != 0 {
                     user_memory.get_val(idx & !USER_MEM_FLAG)
                 } else {
                     base_memory.get_val(idx)
@@ -335,7 +365,11 @@ impl MemoryAttention {
             // 4. Scaled dot product backward
             let mut d_query_b = vec![0.0; self.key_dim];
             for (i, &idx) in cache.top_k_indices[b].iter().enumerate() {
-                let key = if (idx & USER_MEM_FLAG) != 0 {
+                let key = if (idx & PACK_MEM_FLAG) != 0 {
+                    let p_idx = (idx & !PACK_MEM_FLAG) >> PACK_IDX_SHIFT;
+                    let m_idx = idx & MEM_IDX_MASK;
+                    mounted_packs[p_idx].get_key(m_idx)
+                } else if (idx & USER_MEM_FLAG) != 0 {
                     user_memory.get_key(idx & !USER_MEM_FLAG)
                 } else {
                     base_memory.get_key(idx)
@@ -426,12 +460,12 @@ mod tests {
         let hidden_norm = BatchTensor::new(batch_size, hidden_dim);
         let hidden_raw = BatchTensor::new(batch_size, hidden_dim);
 
-        let out1 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, 0, &mut cache);
+        let out1 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, &[], 0, &mut cache);
         assert_eq!(out1.data.ncols(), hidden_dim);
         assert_eq!(cache.prev_fused_h.data.ncols(), hidden_dim);
 
         // Forward second step to verify top-down context usage
-        let out2 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, 0, &mut cache);
+        let out2 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, &[], 0, &mut cache);
         assert_eq!(out2.data.ncols(), hidden_dim);
 
         let _ = std::fs::remove_file("test_base.ant");

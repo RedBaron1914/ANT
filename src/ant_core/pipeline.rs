@@ -26,6 +26,17 @@ pub struct AntPipeline {
     pub readout: ReadoutLayer,
     pub consolidation_energy: f32,
     
+    // Alex Graves' ACT Halting Head
+    pub w_halt: Tensor1D,
+    pub b_halt: f32,
+
+    // Dynamic Z-Score Bayesian Surprisal Filter (EMA)
+    pub surprise_mean: f32,
+    pub surprise_var: f32,
+
+    // Modular .antpack skill cartridges
+    pub mounted_packs: Vec<DiskKVMemory>,
+
     // Tape & Buffers
     pub session_tape: SessionTape,
     pub fifo_buffer: LocalFifoBuffer,
@@ -133,6 +144,10 @@ impl AntPipeline {
             }
         };
 
+        let mut w_halt = Tensor1D::new(hidden_size);
+        let limit_halt = (6.0 / (hidden_size + 1) as f32).sqrt();
+        w_halt.randomize(-limit_halt, limit_halt);
+
         Ok(Self {
             embedding,
             mingru,
@@ -148,6 +163,11 @@ impl AntPipeline {
             gpu_readout,
             readout: ReadoutLayer::new(hidden_size, embed_dim, vocab_size, lora_rank, lora_alpha),
             consolidation_energy,
+            w_halt,
+            b_halt: -1.0,
+            surprise_mean: 3.5,
+            surprise_var: 2.0,
+            mounted_packs: Vec::new(),
             session_tape: SessionTape::new(session_tape_capacity),
             fifo_buffer: LocalFifoBuffer::new(fifo_window_capacity),
             negation_ids: HashSet::new(),
@@ -159,6 +179,30 @@ impl AntPipeline {
             readout_scratch: ReadoutScratchpad::new(batch_size, embed_dim, hidden_size),
             logits: BatchTensor::new(batch_size, vocab_size),
         })
+    }
+
+    /// Mounts all skill cartridges (.antpack) found in packs_dir
+    pub fn load_mounted_packs(&mut self, packs_dir: &str) {
+        self.mounted_packs.clear();
+        let path = Path::new(packs_dir);
+        if path.exists() && path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() && entry_path.extension().map_or(false, |ext| ext == "antpack") {
+                        match DiskKVMemory::open_existing(&entry_path) {
+                            Ok(pack) => {
+                                println!("📦 Mounted skill cartridge: {:?}", entry_path.file_name().unwrap());
+                                self.mounted_packs.push(pack);
+                            }
+                            Err(e) => {
+                                eprintln!("⚠️ Failed to mount pack {:?}: {}", entry_path, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Forward pass through the entire ANT architecture given a batch of token IDs
@@ -173,7 +217,12 @@ impl AntPipeline {
         let emb = self.embedding.forward(tokens);
         
         self.mingru.forward_with_cache(&emb, &mut self.mingru_scratch);
-        let h_1 = self.mingru.hidden_state.clone();
+        let mut h_1 = BatchTensor::new(b_size, self.deltanet2.hidden_size);
+        for b in 0..b_size {
+            for i in 0..self.deltanet2.hidden_size {
+                h_1.data.write(b, i, self.mingru.hidden_state.data.read(b, i));
+            }
+        }
         
         let h_1_norm = self.rmsnorm1.forward(&h_1);
         
@@ -195,17 +244,49 @@ impl AntPipeline {
             }
         }
 
-        let h_2 = self.memory_attention.forward(&h_1_norm, &h_1, &self.base_memory, &self.user_memory, query_metadata, &mut self.memory_attn_cache);
+        let h_2 = self.memory_attention.forward(&h_1_norm, &h_1, &self.base_memory, &self.user_memory, &self.mounted_packs, query_metadata, &mut self.memory_attn_cache);
         
-        let h_2_norm = self.rmsnorm2.forward(&h_2);
-        
-        let mut deltanet_out = BatchTensor::new(b_size, self.deltanet2.hidden_size);
-        self.deltanet2.forward_step(&h_2_norm, query_metadata == 1, &mut deltanet_out);
+        // Alex Graves' ACT Adaptive Deliberation & Krasnoselskii-Mann Attractor
+        let mut h_thought = self.rmsnorm2.forward(&h_2);
+        let max_thinking_steps = 4;
+        let mut accumulated_prob = 0.0f32;
+
+        for _step in 0..max_thinking_steps {
+            let mut deltanet_out = BatchTensor::new(b_size, self.deltanet2.hidden_size);
+            self.deltanet2.forward_step_readonly(&h_thought, query_metadata == 1, &mut deltanet_out);
+            
+            for b in 0..b_size {
+                for j in 0..self.deltanet2.hidden_size {
+                    let prev = h_thought.data.read(b, j);
+                    let cand = prev + deltanet_out.data.read(b, j);
+                    h_thought.data.write(b, j, prev * 0.5 + cand * 0.5);
+                }
+            }
+            
+            let mut p_halt_batch = 0.0f32;
+            for b in 0..b_size {
+                let mut dot = self.b_halt;
+                for j in 0..self.deltanet2.hidden_size {
+                    dot += h_thought.data.read(b, j) * self.w_halt.data[j];
+                }
+                let p_halt = 1.0 / (1.0 + (-dot).exp());
+                p_halt_batch += p_halt;
+            }
+            p_halt_batch /= b_size as f32;
+            accumulated_prob += p_halt_batch;
+            
+            if accumulated_prob >= 1.0 || p_halt_batch > 0.75 {
+                break;
+            }
+        }
+
+        // Final Commit: update S_t EXACTLY ONCE with stabilized thought h*
+        self.deltanet2.commit_state_step(&h_thought, query_metadata == 1);
         
         let mut h_3 = BatchTensor::new(b_size, self.deltanet2.hidden_size);
         for b in 0..b_size {
             for i in 0..self.deltanet2.hidden_size {
-                h_3.data.write(b, i, h_2.data.read(b, i) + deltanet_out.data.read(b, i));
+                h_3.data.write(b, i, h_thought.data.read(b, i));
             }
         }
         
@@ -224,7 +305,7 @@ impl AntPipeline {
             }
             gate_energy /= h_cols as f32;
 
-            // Bayesian Surprise-Gated Memory Ingestion (Goldilocks Filter)
+            // Dynamic Z-Score Bayesian Surprisal Filter (EMA)
             let token = tokens[b];
             let vocab_size = self.embedding.vocab_size;
             let mut max_logit = f32::NEG_INFINITY;
@@ -242,7 +323,13 @@ impl AntPipeline {
                 1.0 / vocab_size as f32
             };
             let token_surprise = -(prob + 1e-7).ln();
-            let is_meaningful_surprise = token_surprise >= 1.0 && token_surprise <= 6.5;
+            let delta = token_surprise - self.surprise_mean;
+            self.surprise_mean += 0.01 * delta;
+            self.surprise_var = (1.0 - 0.01) * self.surprise_var + 0.01 * delta * delta;
+            let std_dev = self.surprise_var.sqrt().max(0.1);
+            let z_score = (token_surprise - self.surprise_mean) / std_dev;
+
+            let is_meaningful_surprise = z_score >= 0.8 && z_score <= 3.5;
 
             let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
             let should_write = (gate_energy > self.consolidation_energy && is_meaningful_surprise) || is_empty;
@@ -293,7 +380,12 @@ impl AntPipeline {
         let emb = self.embedding.forward(tokens);
         
         self.mingru.forward_with_cache(&emb, mingru_scratch);
-        let h_1 = self.mingru.hidden_state.clone();
+        let mut h_1 = BatchTensor::new(b_size, self.deltanet2.hidden_size);
+        for b in 0..b_size {
+            for i in 0..self.deltanet2.hidden_size {
+                h_1.data.write(b, i, self.mingru.hidden_state.data.read(b, i));
+            }
+        }
         
         let h_1_norm = self.rmsnorm1.forward(&h_1);
         
@@ -315,7 +407,7 @@ impl AntPipeline {
             }
         }
 
-        let h_2 = self.memory_attention.forward(&h_1_norm, &h_1, &self.base_memory, &self.user_memory, query_metadata, &mut self.memory_attn_cache);
+        let h_2 = self.memory_attention.forward(&h_1_norm, &h_1, &self.base_memory, &self.user_memory, &self.mounted_packs, query_metadata, &mut self.memory_attn_cache);
         
         let h_2_norm = self.rmsnorm2.forward(&h_2);
         
@@ -345,7 +437,7 @@ impl AntPipeline {
             }
             gate_energy /= h_cols as f32;
 
-            // Bayesian Surprise-Gated Memory Ingestion (Goldilocks Filter)
+            // Dynamic Z-Score Bayesian Surprisal Filter (EMA)
             let token = tokens[b];
             let vocab_size = self.embedding.vocab_size;
             let mut max_logit = f32::NEG_INFINITY;
@@ -363,7 +455,13 @@ impl AntPipeline {
                 1.0 / vocab_size as f32
             };
             let token_surprise = -(prob + 1e-7).ln();
-            let is_meaningful_surprise = token_surprise >= 1.0 && token_surprise <= 6.5;
+            let delta = token_surprise - self.surprise_mean;
+            self.surprise_mean += 0.01 * delta;
+            self.surprise_var = (1.0 - 0.01) * self.surprise_var + 0.01 * delta * delta;
+            let std_dev = self.surprise_var.sqrt().max(0.1);
+            let z_score = (token_surprise - self.surprise_mean) / std_dev;
+
+            let is_meaningful_surprise = z_score >= 0.8 && z_score <= 3.5;
 
             let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
             let should_write = (gate_energy > self.consolidation_energy && is_meaningful_surprise) || is_empty;

@@ -196,6 +196,21 @@ enum Commands {
 
     /// Run full neural integrity and diagnostic test suite
     Test,
+
+    /// Compile a knowledge dataset into a standalone .antpack cartridge
+    Pack {
+        /// Path to text dataset to compile into cartridge
+        #[arg(short, long)]
+        data: String,
+        
+        /// Output cartridge name (e.g. "cpp_knowledge" -> packs/cpp_knowledge.antpack)
+        #[arg(short, long)]
+        name: String,
+        
+        /// Target memory capacity for the pack
+        #[arg(short, long, default_value_t = 10000)]
+        capacity: usize,
+    },
 }
 
 #[tokio::main]
@@ -302,6 +317,7 @@ async fn main() {
                 println!("⚠️ WARNING: No trained model found at {}. Using random weights!", config.training.model_path);
             }
             
+            pipeline.load_mounted_packs("packs");
             chat::run_chat(&mut pipeline, prompt.as_deref(), &config.chat, &config.model.tokenizer_path);
         }
 
@@ -342,6 +358,97 @@ async fn main() {
 
         Commands::Test => {
             crate::ant_core::sanity_check::run_full_diagnostics(&config);
+        }
+
+        Commands::Pack { data, name, capacity } => {
+            std::fs::create_dir_all("packs").expect("Failed to create packs directory");
+            let pack_filename = if name.ends_with(".antpack") {
+                format!("packs/{}", name)
+            } else {
+                format!("packs/{}.antpack", name)
+            };
+            
+            let (vocab, embed, hidden) = if Path::new(&config.training.model_path).exists() {
+                let header = format::AntHeader::read_from_file(&config.training.model_path).unwrap();
+                (header.vocab_size as usize, header.embed_dim as usize, header.hidden_size as usize)
+            } else {
+                (config.model.vocab_size, config.model.embed_dim, config.model.hidden_size)
+            };
+
+            let temp_base = "temp_pack_base.ant";
+            let temp_user = "temp_pack_user.ant";
+            let _ = std::fs::remove_file(temp_base);
+            let _ = std::fs::remove_file(temp_user);
+
+            let mut pipeline = ant_core::pipeline::AntPipeline::new(
+                temp_base,
+                temp_user,
+                vocab, embed, hidden,
+                1, 
+                capacity, capacity,
+                config.memory.top_k_base, config.memory.top_k_user,
+                config.memory.consolidation_energy,
+                config.session_tape.capacity, config.session_tape.fifo_window,
+                config.continual_learning.lora_rank, config.continual_learning.lora_alpha,
+                true
+            ).expect("Failed to create pack builder pipeline");
+
+            if Path::new(&config.training.model_path).exists() {
+                pipeline.load_weights(&config.training.model_path).expect("Failed to load model weights");
+            }
+
+            let tokenizer = tokenizers::Tokenizer::from_file(&config.model.tokenizer_path).expect("Failed to load tokenizer");
+            pipeline.negation_ids = ant_core::pipeline::get_negation_ids(&tokenizer);
+
+            let _ = std::fs::remove_file(&pack_filename);
+            let mut pack_memory = ant_core::memory_io::DiskKVMemory::new(&pack_filename, capacity, embed, hidden)
+                .expect("Failed to initialize .antpack file");
+
+            println!("📦 Compiling cartridge `{}` from `{}` (capacity: {})...", pack_filename, data, capacity);
+
+            let content = std::fs::read_to_string(&data).expect("Failed to read dataset file");
+            let encoding = tokenizer.encode(content, false).expect("Tokenization failed");
+            let token_ids: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
+
+            pipeline.is_training = true;
+            let mut stored_count = 0usize;
+
+            for (idx, &token) in token_ids.iter().enumerate() {
+                let _logits = pipeline.forward(&[token]);
+                
+                if pipeline.base_memory.current_size > 0 {
+                    let last_idx = pipeline.base_memory.current_size - 1;
+                    let key = pipeline.base_memory.get_key(last_idx);
+                    let val = pipeline.base_memory.get_val(last_idx);
+                    let meta = pipeline.base_memory.get_metadata(last_idx);
+                    
+                    let mut k_t = ant_core::tensor::Tensor1D::new(embed);
+                    k_t.data.copy_from_slice(key);
+                    let mut v_t = ant_core::tensor::Tensor1D::new(hidden);
+                    v_t.data.copy_from_slice(val);
+                    
+                    pack_memory.add_memory(k_t, v_t, meta);
+                    stored_count += 1;
+                    
+                    pipeline.base_memory.current_size = 0;
+                    pipeline.base_memory.write_cursor = 0;
+                }
+
+                if (idx + 1) % 500 == 0 || idx + 1 == token_ids.len() {
+                    print!("\r   Progress: {}/{} tokens processed, {} memories captured", idx + 1, token_ids.len(), stored_count);
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                }
+            }
+            println!();
+
+            println!("🧹 Running cosine deduplication & consolidation (threshold = 0.95)...");
+            pack_memory.compress_and_prune(0.95);
+
+            println!("🎉 Pack `{}` created successfully! ({} consolidated memories)", pack_filename, pack_memory.current_size);
+
+            let _ = std::fs::remove_file(temp_base);
+            let _ = std::fs::remove_file(temp_user);
         }
     }
 }

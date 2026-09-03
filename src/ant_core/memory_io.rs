@@ -69,6 +69,38 @@ impl DiskKVMemory {
         })
     }
 
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+            
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        if mmap.len() < Self::HEADER_SIZE {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cartridge file smaller than header"));
+        }
+        
+        let file_version = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+        if file_version != 3 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unsupported version {} in cartridge! Expected 3", file_version)));
+        }
+        
+        let capacity = usize::from_le_bytes(mmap[8..16].try_into().unwrap());
+        let current_size = usize::from_le_bytes(mmap[16..24].try_into().unwrap());
+        let key_dim = usize::from_le_bytes(mmap[24..32].try_into().unwrap());
+        let val_dim = usize::from_le_bytes(mmap[32..40].try_into().unwrap());
+        let write_cursor = usize::from_le_bytes(mmap[40..48].try_into().unwrap());
+
+        Ok(Self {
+            capacity,
+            key_dim,
+            val_dim,
+            mmap,
+            current_size,
+            write_cursor,
+        })
+    }
+
     fn normalize_inplace(tensor: &mut Tensor1D) {
         let mut norm_sq = 0.0;
         for val in tensor.data.iter() {

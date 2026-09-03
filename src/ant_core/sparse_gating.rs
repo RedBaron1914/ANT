@@ -44,7 +44,7 @@ impl SparseGating {
         self.w1.matmul_batch(input, &mut self.hidden);
         
         let h_size = self.hidden.data.ncols();
-        let b_size = self.hidden.data.nrows();
+        let b_size = input.data.nrows();
         
         // Add bias + ReLU activation (Sparse representation)
         for b in 0..b_size {

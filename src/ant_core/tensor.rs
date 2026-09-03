@@ -92,16 +92,29 @@ impl Tensor2D {
     // out = input * self^T
     // out: (batch, rows) = input: (batch, cols) * self^T: (cols, rows)
     pub fn matmul_batch(&self, input: &BatchTensor, out: &mut BatchTensor) {
-        let size = self.rows * self.cols * input.data.rows;
+        let b_size = std::cmp::min(input.data.rows, out.data.rows);
+        let size = self.rows * self.cols * b_size;
         let parallel = if size > 2_000_000 {
             faer::Par::Rayon(std::num::NonZeroUsize::new(rayon::current_num_threads()).unwrap())
         } else {
             faer::Par::Seq
         };
+        let input_view = if input.data.rows == b_size {
+            input.data.as_ref()
+        } else {
+            input.data.as_ref().submatrix(0, 0, b_size, self.cols)
+        };
+        let out_rows = out.data.rows;
+        let out_view = out.data.as_mut();
+        let target_dst = if out_rows == b_size {
+            out_view
+        } else {
+            out_view.submatrix_mut(0, 0, b_size, self.rows)
+        };
         faer::linalg::matmul::matmul(
-            out.data.as_mut(),
+            target_dst,
             faer::Accum::Replace,
-            input.data.as_ref(),
+            input_view,
             self.as_mat().transpose(),
             1.0,
             parallel,
@@ -155,9 +168,9 @@ impl BatchMat {
     }
 
     pub fn copy_from(&mut self, other: &Self) {
-        assert_eq!(self.rows, other.rows, "Rows mismatch in copy_from");
         assert_eq!(self.cols, other.cols, "Cols mismatch in copy_from");
-        self.storage.copy_from_slice(&other.storage);
+        let n = std::cmp::min(self.rows, other.rows) * self.cols;
+        self.storage[..n].copy_from_slice(&other.storage[..n]);
     }
 
     pub fn nrows(&self) -> usize {

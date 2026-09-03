@@ -330,6 +330,7 @@ impl Trainer {
                     &h_1,
                     &self.pipeline.base_memory,
                     &self.pipeline.user_memory,
+                    &self.pipeline.mounted_packs,
                     query_polarity,
                     &mut attn_cache_history[t]
                 );
@@ -505,6 +506,7 @@ impl Trainer {
                     &d_h_2_total,
                     &self.pipeline.base_memory,
                     &self.pipeline.user_memory,
+                    &self.pipeline.mounted_packs,
                     &mut attn_cache_history[t],
                     &mut grad_hidden_raw,
                 );

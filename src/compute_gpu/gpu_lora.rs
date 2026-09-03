@@ -290,4 +290,38 @@ impl GpuLoraLinear {
             step_w(&mut self.d_w_base, &mut self.d_w_base_grad, &mut self.m_w_base, self.rows * self.cols);
         }
     }
+
+    /// Fuses trained adapter weights into base weights on GPU via cuBLAS and resets adapter
+    pub fn merge_into_base(&mut self, cublas: &CudaBlas, stream: &Arc<CudaStream>) {
+        if self.rank == 0 { return; }
+        let scale = self.alpha / (self.rank as f32);
+        let cfg_merge = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: self.cols as i32,
+            n: self.rows as i32,
+            k: self.rank as i32,
+            alpha: scale,
+            lda: self.cols as i32,
+            ldb: self.rank as i32,
+            beta: 1.0,
+            ldc: self.cols as i32,
+        };
+        unsafe {
+            cublas.gemm(cfg_merge, &self.d_lora_a, &self.d_lora_b, &mut self.d_w_base).unwrap();
+        }
+
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let a_size = self.rank * self.cols;
+        let mut host_a = vec![0.0f32; a_size];
+        for val in host_a.iter_mut() {
+            *val = rng.gen_range(-0.1..0.1);
+        }
+        stream.memcpy_htod(&host_a, &mut self.d_lora_a).unwrap();
+        
+        let b_size = self.rows * self.rank;
+        let host_b = vec![0.0f32; b_size];
+        stream.memcpy_htod(&host_b, &mut self.d_lora_b).unwrap();
+    }
 }

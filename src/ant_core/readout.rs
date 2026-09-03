@@ -51,18 +51,19 @@ impl ReadoutLayer {
         let b_size = hidden.data.rows;
         
         // 1. h_proj = hidden * w_proj^T (using LoRA)
-        self.w_proj.forward(hidden, &mut scratch.h_proj, &mut scratch.lora_scratch);
+        let mut h_proj = BatchTensor::new(b_size, self.embed_dim);
+        self.w_proj.forward(hidden, &mut h_proj, &mut scratch.lora_scratch);
         
         // Add bias
         for b in 0..b_size {
             for i in 0..self.embed_dim {
-                let val = scratch.h_proj.data.read(b, i) + self.b_proj.data[i];
-                scratch.h_proj.data.write(b, i, val);
+                let val = h_proj.data.read(b, i) + self.b_proj.data[i];
+                h_proj.data.write(b, i, val);
             }
         }
         
         // 2. logits = h_proj * embedding.weight^T
-        embedding.weight.matmul_batch(&scratch.h_proj, logits);
+        embedding.weight.matmul_batch(&h_proj, logits);
     }
     
     pub fn backward<'a>(&mut self, hidden: &BatchTensor, d_logits: &BatchTensor, embedding: &mut Embedding, scratch: &'a mut ReadoutScratchpad) -> &'a BatchTensor {

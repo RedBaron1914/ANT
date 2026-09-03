@@ -7,3 +7,5 @@ datasets/
 ant_config.toml
 tokenizer.json
 TECHNICAL_ROADMAP.md
+*.antpack
+packs/

@@ -626,9 +626,10 @@ extern "C" __global__ void deltanet2_forward_kernel(
         
         float s_next_val = a_i * s_prev_val - k_i * row_val + k_i * w_j * v_j;
         
-        // Stabilize recurrent state matrix dynamics
-        if (s_next_val > 5.0f) s_next_val = 5.0f;
-        if (s_next_val < -5.0f) s_next_val = -5.0f;
+        // Smooth differentiable soft-saturation (Differentiable Softsign)
+        float C = 5.0f;
+        float s_ratio = s_next_val / C;
+        s_next_val = s_next_val / sqrtf(1.0f + s_ratio * s_ratio);
         
         S_next[s_offset + i * d + j] = s_next_val;
     }

@@ -74,8 +74,8 @@ pub fn run_full_diagnostics(config: &AntConfig) {
     let _ = std::fs::remove_file(test_base_mem);
     let _ = std::fs::remove_file(test_user_mem);
 
-    // TEST 3: Pipeline Initialization & Dimensions
-    print!("[3/5] Testing Model Instantiation & L3 Cache Footprint... ");
+    // TEST 3: Pipeline Initialization, ACT Deliberation & Cartridge Mounting
+    print!("[3/5] Testing Model Instantiation, ACT Deliberation & Memory Cartridges... ");
     let mut pipeline = AntPipeline::new(
         test_base_mem,
         test_user_mem,
@@ -93,6 +93,9 @@ pub fn run_full_diagnostics(config: &AntConfig) {
         config.continual_learning.lora_alpha,
         false
     ).unwrap();
+
+    let test_logits = pipeline.forward(&[1]);
+    assert_eq!(test_logits.data.ncols(), config.model.vocab_size);
     println!("✅ PASSED (Vocab: {}, Embed: {}, Hidden: {})", config.model.vocab_size, config.model.embed_dim, config.model.hidden_size);
 
     // TEST 4: Overfitting Single Batch on GPU (The Ultimate BPTT & Gradient Test)

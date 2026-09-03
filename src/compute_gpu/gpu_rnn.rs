@@ -649,7 +649,7 @@ impl GpuAccelerator {
         for t in 0..c {
             let mut d_prev_h_t = self.history.d_mingru_h.try_slice_mut(t*bh .. (t+1)*bh).unwrap();
             if t == 0 {
-                self.stream.memcpy_htod(&pipeline.mingru.hidden_state.data.storage, &mut d_prev_h_t).unwrap();
+                self.stream.memcpy_htod(&pipeline.mingru.hidden_state.data.storage[..b * h], &mut d_prev_h_t).unwrap();
             }
 
             let prev_h_ptr = {
@@ -850,7 +850,7 @@ impl GpuAccelerator {
         for t in 0..c {
             let mut d_prev_state = self.history.d_deltanet_states.try_slice_mut(t * state_size .. (t+1) * state_size).unwrap();
             if t == 0 {
-                self.stream.memcpy_htod(&pipeline.deltanet2.state, &mut d_prev_state).unwrap();
+                self.stream.memcpy_htod(&pipeline.deltanet2.state[..b * h * h], &mut d_prev_state).unwrap();
             }
             
             let prev_state_ptr = {
