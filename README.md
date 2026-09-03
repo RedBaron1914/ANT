@@ -19,7 +19,7 @@ The project is inspired by research on asynchronous Turing-complete neural compu
 Instead of static Transformer-style self-attention, ANT uses a two-layer recurrent backbone coupled with adaptive deliberation:
 
 - **minGRU (Layer 1):** A lightweight gated recurrent unit without explicit $h_{t-1}$ gate coupling, optimized for fast local sequence modeling.
-- **Adaptive Deliberation & Frozen-State Thinking (ACT):** Deliberation occurs in working memory ($h$). During internal sub-steps, the associative matrix $S_{t-1}$ remains frozen (read-only) while thought candidates stabilize under Krasnoselskii-Mann attractor damping. An $O(d)$ scalar halting head determines when thought stabilizes before updating state $S_t$ exactly once.
+- **Adaptive Deliberation & Frozen-State Thinking (ACT):** Deliberation occurs in working memory ($h$). During internal sub-steps, the associative matrix $S_{t-1}$ remains frozen (read-only) while thought candidates stabilize under Krasnoselskii-Mann attractor damping ($0.5 \cdot \text{prev} + 0.5 \cdot \text{cand}$). Thought deliberation halts once the Euclidean distance between successive updates drops below convergence tolerance ($\delta < 0.02$, up to 4 thinking steps) before updating state $S_t$ exactly once.
 - **Gated DeltaNet-2 with Soft-Saturation (Layer 2):** Maintains a linear associative matrix state $S_t \in \mathbb{R}^{d \times d}$ with decoupled Erase ($b_t$) and Write ($w_t$) gates. Replaces hard clamping with smooth, differentiable soft-saturation ($S_{\text{next}} = S_{\text{raw}} / \sqrt{1 + (S_{\text{raw}}/5.0)^2}$) to eliminate gradient cliffs.
 - **RMSNorm & residual connections** are applied throughout layers for stability.
 
@@ -40,16 +40,17 @@ To prevent memory corruption from repetitive routine or chaotic noise, memory in
  │ LEVEL 1: Recurrent State (minGRU h_t + DeltaNet-2 S_t)   │
  ├──────────────────────────────────────────────────────────┤
  │ LEVEL 2: Associative Key-Value Index (GPU VRAM / RAM)     │
- │  - base_knowledge.ant (read-only)                        │
- │  - user_experience.ant (read-write)                      │
+ │  - base_knowledge.ant (read-only DiskKVMemory mmap)      │
+ │  - user_experience.ant (read-write DiskKVMemory mmap)    │
  │  - packs/*.antpack (modular read-only skill cartridges)  │
  ├──────────────────────────────────────────────────────────┤
- │ LEVEL 3: Lossless Session Tape (NVMe mmap)                │
+ │ LEVEL 3: Lossless Session Tape (RAM Ring Buffer)          │
  └──────────────────────────────────────────────────────────┘
 ```
 
-- **Dual Base / User Memory:** `base_knowledge.ant` stores static factual data; `user_experience.ant` records interactive episodic memories.
+- **Dual Base / User Memory:** `base_knowledge.ant` stores static factual data; `user_experience.ant` records interactive episodic memories via memory-mapped files (`DiskKVMemory` with `MmapMut`).
 - **Modular `.antpack` Skill Cartridges:** Pre-compiled domain packages stored in `packs/` that are automatically discovered and queried in unified associative memory attention.
+- **Level 3 Session Tape:** In-memory ring buffer (`SessionTape`) preserving the exact token stream of the active session without lossy compression.
 - **Sleep Phase:** Performs autonomous generative rollout dreams and cosine deduplication ($0.95$ threshold) to prune redundant episodic entries.
 
 ### Training & Lifelong Adaptation
@@ -83,7 +84,7 @@ cargo build --release
 cargo run --release -- init
 ```
 
-Generates `ant_config.toml` and the initial tokenizer.
+Generates `ant_config.toml`. Edit the configuration to customize your model dimensions, memory paths, and training parameters. Place a HuggingFace BPE `tokenizer.json` (vocab size matching `ant_config.toml`, e.g. 9016) at the configured `tokenizer_path`.
 
 ### 3. Neural Integrity & Diagnostic Harness
 

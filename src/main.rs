@@ -227,7 +227,10 @@ async fn main() {
     match cli.command {
         Commands::Init => {
             config.save();
-            println!("✅ Project initialized! Edit `ant_config.toml` to change base settings.");
+            println!("✅ Project initialized! Created `ant_config.toml`.");
+            if !std::path::Path::new(&config.model.tokenizer_path).exists() {
+                println!("⚠️  Note: `{}` not found. Place a HuggingFace BPE `tokenizer.json` at the configured path before training or chatting.", config.model.tokenizer_path);
+            }
         }
 
         Commands::Train { data, epochs, lr } => {
