@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 use std::fs;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use crate::ant_core::tensor::{MatExt, BatchTensor};
 use crate::ant_core::pipeline::AntPipeline;
 use crate::ant_core::optim::SGD;
@@ -95,8 +96,27 @@ impl Trainer {
     }
 
     pub fn sleep_phase(&mut self, _replay_dataset: &TextDataset, _seq_len: usize, steps: usize) {
-        println!("[ANT Sleep Phase] Initiating Memory Consolidation...");
+        println!("[ANT Sleep Phase] Starting Autonomous Generative Dream Rollout (50 steps)...");
         
+        let mut rng = rand::thread_rng();
+        let vocab_size = self.pipeline.embedding.vocab_size;
+        let mut current_token = rng.gen_range(0..vocab_size);
+
+        for _ in 0..50 {
+            let logits = self.pipeline.forward(&[current_token]);
+            let mut best_token = 0;
+            let mut max_val = f32::NEG_INFINITY;
+            for tok in 0..vocab_size {
+                let val = logits.data.read(0, tok);
+                if val > max_val {
+                    max_val = val;
+                    best_token = tok;
+                }
+            }
+            current_token = best_token;
+        }
+
+        println!("[ANT Sleep Phase] Initiating Memory Consolidation & Pruning...");
         self.pipeline.base_memory.compress_and_prune(0.95);
         self.pipeline.user_memory.compress_and_prune(0.95);
 

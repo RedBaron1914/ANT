@@ -224,9 +224,30 @@ impl AntPipeline {
             }
             gate_energy /= h_cols as f32;
 
-            let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
+            // Bayesian Surprise-Gated Memory Ingestion (Goldilocks Filter)
+            let token = tokens[b];
+            let vocab_size = self.embedding.vocab_size;
+            let mut max_logit = f32::NEG_INFINITY;
+            for v in 0..vocab_size {
+                let l = self.logits.data.read(b, v);
+                if l > max_logit { max_logit = l; }
+            }
+            let mut sum_exp = 0.0;
+            for v in 0..vocab_size {
+                sum_exp += (self.logits.data.read(b, v) - max_logit).exp();
+            }
+            let prob = if sum_exp > 0.0 && token < vocab_size {
+                (self.logits.data.read(b, token) - max_logit).exp() / sum_exp
+            } else {
+                1.0 / vocab_size as f32
+            };
+            let token_surprise = -(prob + 1e-7).ln();
+            let is_meaningful_surprise = token_surprise >= 1.0 && token_surprise <= 6.5;
 
-            if gate_energy > self.consolidation_energy || is_empty {
+            let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
+            let should_write = (gate_energy > self.consolidation_energy && is_meaningful_surprise) || is_empty;
+
+            if should_write {
                 let mut key = Tensor1D::new(self.embedding.embed_dim);
                 let mut val = Tensor1D::new(self.mingru.hidden_state.data.cols);
                 for i in 0..self.embedding.embed_dim {
@@ -324,9 +345,30 @@ impl AntPipeline {
             }
             gate_energy /= h_cols as f32;
 
-            let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
+            // Bayesian Surprise-Gated Memory Ingestion (Goldilocks Filter)
+            let token = tokens[b];
+            let vocab_size = self.embedding.vocab_size;
+            let mut max_logit = f32::NEG_INFINITY;
+            for v in 0..vocab_size {
+                let l = self.logits.data.read(b, v);
+                if l > max_logit { max_logit = l; }
+            }
+            let mut sum_exp = 0.0;
+            for v in 0..vocab_size {
+                sum_exp += (self.logits.data.read(b, v) - max_logit).exp();
+            }
+            let prob = if sum_exp > 0.0 && token < vocab_size {
+                (self.logits.data.read(b, token) - max_logit).exp() / sum_exp
+            } else {
+                1.0 / vocab_size as f32
+            };
+            let token_surprise = -(prob + 1e-7).ln();
+            let is_meaningful_surprise = token_surprise >= 1.0 && token_surprise <= 6.5;
 
-            if gate_energy > self.consolidation_energy || is_empty {
+            let is_empty = if self.is_training { self.base_memory.current_size == 0 } else { self.user_memory.current_size == 0 };
+            let should_write = (gate_energy > self.consolidation_energy && is_meaningful_surprise) || is_empty;
+
+            if should_write {
                 let mut key = Tensor1D::new(self.embedding.embed_dim);
                 let mut val = Tensor1D::new(self.mingru.hidden_state.data.cols);
                 for i in 0..self.embedding.embed_dim {

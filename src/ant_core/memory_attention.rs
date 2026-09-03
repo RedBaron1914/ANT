@@ -20,6 +20,9 @@ pub struct MemoryAttentionCache {
     // LoRA scratchpads
     pub lora_q_scratch: LoraScratchpad,
     pub lora_fuse_scratch: LoraScratchpad,
+
+    // Top-down narrative prior from previous time step
+    pub prev_fused_h: BatchTensor,
 }
 
 impl MemoryAttentionCache {
@@ -40,6 +43,7 @@ impl MemoryAttentionCache {
 
             lora_q_scratch: LoraScratchpad::new(batch_size, key_dim, max_lora_rank),
             lora_fuse_scratch: LoraScratchpad::new(batch_size, hidden_dim, max_lora_rank),
+            prev_fused_h: BatchTensor::new(batch_size, hidden_dim),
         }
     }
 }
@@ -95,9 +99,19 @@ impl MemoryAttention {
         let b_size = hidden_norm.data.nrows();
         let scale = 1.0 / (self.key_dim as f32).sqrt();
 
-        // 1. Query projection: q = tanh(W_q * h_norm + b_q)
+        // 1. Top-down contextual prior on query projection:
+        // h_context = h_norm + 0.5 * prev_fused_h
+        // q = tanh(W_q * h_context + b_q)
+        let mut h_context = BatchTensor::new(b_size, self.hidden_dim);
+        for b in 0..b_size {
+            for i in 0..self.hidden_dim {
+                let val = hidden_norm.data.read(b, i) + 0.5 * cache.prev_fused_h.data.read(b, i);
+                h_context.data.write(b, i, val);
+            }
+        }
+
         let mut q_in = BatchTensor::new(b_size, self.key_dim);
-        self.w_q.forward(hidden_norm, &mut q_in, &mut cache.lora_q_scratch);
+        self.w_q.forward(&h_context, &mut q_in, &mut cache.lora_q_scratch);
         
         for b in 0..b_size {
             for i in 0..self.key_dim {
@@ -233,6 +247,8 @@ impl MemoryAttention {
                 fused_h.data.write(b, i, hidden_raw.data.read(b, i) + fuse_in.data.read(b, i) + self.b_fuse.data[i]);
             }
         }
+
+        cache.prev_fused_h.data.copy_from(&fused_h.data);
 
         fused_h
     }
@@ -389,5 +405,36 @@ impl Parameterized for MemoryAttention {
         res.extend(self.w_fuse.grads_mut());
         res.push(&mut self.b_fuse.grad);
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_attention_prior_cache() {
+        let key_dim = 16;
+        let hidden_dim = 32;
+        let batch_size = 1;
+        let mem_attn = MemoryAttention::new(key_dim, hidden_dim, 2, 2, 4, 1.0);
+        let mut cache = MemoryAttentionCache::new(batch_size, key_dim, hidden_dim, 4);
+
+        let base_mem = DiskKVMemory::new("test_base.ant", 10, key_dim, hidden_dim).unwrap();
+        let user_mem = DiskKVMemory::new("test_user.ant", 10, key_dim, hidden_dim).unwrap();
+
+        let hidden_norm = BatchTensor::new(batch_size, hidden_dim);
+        let hidden_raw = BatchTensor::new(batch_size, hidden_dim);
+
+        let out1 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, 0, &mut cache);
+        assert_eq!(out1.data.ncols(), hidden_dim);
+        assert_eq!(cache.prev_fused_h.data.ncols(), hidden_dim);
+
+        // Forward second step to verify top-down context usage
+        let out2 = mem_attn.forward(&hidden_norm, &hidden_raw, &base_mem, &user_mem, 0, &mut cache);
+        assert_eq!(out2.data.ncols(), hidden_dim);
+
+        let _ = std::fs::remove_file("test_base.ant");
+        let _ = std::fs::remove_file("test_user.ant");
     }
 }
