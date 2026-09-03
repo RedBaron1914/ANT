@@ -1,3 +1,8 @@
+//! Note on Neuromorphic Execution:
+//! The standard inference pipeline operates in continuous surrogate mode (FP32/cuBLAS) for conversational latency.
+//! The event-driven neuromorphic kernel (avx2_spiking.rs) is an experimental backend for pure discrete spike-accumulation
+//! (INT8 x Binary Spikes), requiring manual temporal rate-encoding.
+
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 

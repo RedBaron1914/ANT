@@ -6,21 +6,32 @@
 
 ANT is a stateful recurrent neural runtime written in Rust with custom CUDA C++ kernels and cuBLAS acceleration. It has no PyTorch, LibTorch, or Python dependencies.
 
-The project is inspired by research on asynchronous Turing-complete neural computation (Siegelmann et al., 2026).
+The project is inspired by research on asynchronous Turing-complete neural computation (Siegelmann et al., 2026), predictive processing, and active inference.
+
+> **Note on Neuromorphic Execution:** The standard inference pipeline operates in continuous surrogate mode (FP32/cuBLAS) for conversational latency. The event-driven neuromorphic kernel (`avx2_spiking.rs`) is an experimental backend for pure discrete spike-accumulation (INT8 x Binary Spikes), requiring manual temporal rate-encoding.
 
 ---
 
 ## Architecture Overview
 
-### Recurrent Core
+### Recurrent Core & Deliberation
 
-Instead of Transformer-style attention, ANT uses a two-layer recurrent backbone:
+Instead of static Transformer-style self-attention, ANT uses a two-layer recurrent backbone coupled with adaptive deliberation:
 
-- **minGRU (Layer 1):** A lightweight gated recurrent unit without explicit `h_{t-1}` gate coupling, suited for fast local sequence modeling.
-- **Gated DeltaNet-2 (Layer 2):** Maintains a linear associative matrix state $S_t \in \mathbb{R}^{d \times d}$ with separate Erase ($b_t$) and Write ($w_t$) gates, allowing selective in-context updates.
-- **RMSNorm & residual connections** are applied between layers for training stability.
+- **minGRU (Layer 1):** A lightweight gated recurrent unit without explicit $h_{t-1}$ gate coupling, optimized for fast local sequence modeling.
+- **Adaptive Deliberation & Frozen-State Thinking (ACT):** Deliberation occurs in working memory ($h$). During internal sub-steps, the associative matrix $S_{t-1}$ remains frozen (read-only) while thought candidates stabilize under Krasnoselskii-Mann attractor damping. An $O(d)$ scalar halting head determines when thought stabilizes before updating state $S_t$ exactly once.
+- **Gated DeltaNet-2 with Soft-Saturation (Layer 2):** Maintains a linear associative matrix state $S_t \in \mathbb{R}^{d \times d}$ with decoupled Erase ($b_t$) and Write ($w_t$) gates. Replaces hard clamping with smooth, differentiable soft-saturation ($S_{\text{next}} = S_{\text{raw}} / \sqrt{1 + (S_{\text{raw}}/5.0)^2}$) to eliminate gradient cliffs.
+- **RMSNorm & residual connections** are applied throughout layers for stability.
 
-### Memory Hierarchy
+### GIGO Defense: Dynamic Z-Score Bayesian Surprisal Filter
+
+To prevent memory corruption from repetitive routine or chaotic noise, memory ingestion is gated by an Exponential Moving Average (EMA) Z-score tracker:
+
+- Evaluates token surprisal $s_t = -\ln(P_{t-1}(x_t) + 10^{-7})$.
+- Tracks running mean $\mu$ and variance $\sigma^2$ ($\lambda = 0.01$).
+- Ingestion triggers only for meaningful prediction errors ($0.8 \le Z \le 3.5$), discarding both mundane events ($Z < 0.8$) and unstructured garbage ($Z > 3.5$).
+
+### Memory Hierarchy & `.antpack` Cartridges
 
 ```text
  ┌──────────────────────────────────────────────────────────┐
@@ -29,36 +40,24 @@ Instead of Transformer-style attention, ANT uses a two-layer recurrent backbone:
  │ LEVEL 1: Recurrent State (minGRU h_t + DeltaNet-2 S_t)   │
  ├──────────────────────────────────────────────────────────┤
  │ LEVEL 2: Associative Key-Value Index (GPU VRAM / RAM)     │
- │  - base_knowledge.ant (read-only) + user_experience.ant  │
+ │  - base_knowledge.ant (read-only)                        │
+ │  - user_experience.ant (read-write)                      │
+ │  - packs/*.antpack (modular read-only skill cartridges)  │
  ├──────────────────────────────────────────────────────────┤
  │ LEVEL 3: Lossless Session Tape (NVMe mmap)                │
  └──────────────────────────────────────────────────────────┘
 ```
 
-**Level 2** uses dense cosine $k$-NN search on GPU VRAM for retrieval. New entries are written during inference when the sparse gating layer detects a high novelty signal. A separate `sleep` phase clusters and deduplicates stored vectors.
+- **Dual Base / User Memory:** `base_knowledge.ant` stores static factual data; `user_experience.ant` records interactive episodic memories.
+- **Modular `.antpack` Skill Cartridges:** Pre-compiled domain packages stored in `packs/` that are automatically discovered and queried in unified associative memory attention.
+- **Sleep Phase:** Performs autonomous generative rollout dreams and cosine deduplication ($0.95$ threshold) to prune redundant episodic entries.
 
-**Level 3** is a memory-mapped append-only log that preserves the exact token stream without attention-based compression loss.
+### Training & Lifelong Adaptation
 
-### Training
-
-Training runs fully on GPU via BPTT across sequence chunks. Key details:
-
-- All forward and backward tensors are pre-allocated in VRAM (`GpuHistory`) — no per-chunk heap allocation on the hot path.
-- The cross-entropy loss and readout kernels are queued asynchronously on the CUDA stream; the CPU thread does not block mid-pass.
-- Gate energies are computed with a GPU reduction kernel (`compute_gate_energy_kernel`) rather than downloading pre-activations to the host.
-- Parameter updates use a CUDA implementation of the Lion optimizer.
-- LoRA adapters are trained alongside base weights and stored in VRAM during the training session.
-
-### Dual `.ant` Storage
-
-Memory is split into two separate files:
-
-| File | Mode | Purpose |
-|---|---|---|
-| `base_knowledge.ant` | Read-only | Pre-trained factual knowledge |
-| `user_experience.ant` | Read-write | Session-learned episodic memories |
-
-Both are searched jointly at inference time.
+- **GPU BPTT Engine:** All forward and backward passes run in VRAM (`GpuHistory`) without per-chunk host allocations.
+- **Asynchronous Readout:** Cross-entropy loss and tied-weight embedding projections execute on CUDA streams.
+- **Lion Optimizer:** Kernel-level parameter updates for base weights and LoRA adapters.
+- **LoRA Merging & Reset (`merge_into_base`):** Fuses trained adapter deltas into base matrices ($W \leftarrow W + \frac{\alpha}{r} BA$) and resets low-rank subspaces to prevent lifelong saturation.
 
 ---
 
@@ -84,9 +83,17 @@ cargo build --release
 cargo run --release -- init
 ```
 
-This generates `ant_config.toml` and the initial tokenizer. Edit the config to set your model dimensions, memory paths, and training parameters before proceeding.
+Generates `ant_config.toml` and the initial tokenizer.
 
-### 3. Train
+### 3. Neural Integrity & Diagnostic Harness
+
+Run the automated diagnostic suite (~10s) to verify memory deduplication, negation ranking, ACT deliberation, GPU BPTT loss convergence, and state clamping:
+
+```bash
+cargo run --release -- test
+```
+
+### 4. Train
 
 ```bash
 # Train from scratch or resume from checkpoint:
@@ -96,13 +103,23 @@ cargo run --release -- train --data datasets/your_dataset.txt --epochs 10 --lr 0
 cargo run --release -- train --data datasets/your_dataset.txt --epochs 5 --lr 0.00002
 ```
 
-### 4. Chat
+### 5. Build `.antpack` Skill Cartridges
+
+Compile arbitrary domain text files into standalone, deduplicated skill cartridges:
+
+```bash
+cargo run --release -- pack --data datasets/cpp_reference.txt --name cpp_knowledge --capacity 10000
+```
+
+All `.antpack` files placed in `packs/` are automatically mounted during chat.
+
+### 6. Chat
 
 ```bash
 cargo run --release -- chat
 ```
 
-### 5. Memory consolidation (sleep phase)
+### 7. Memory Consolidation (Sleep Phase)
 
 ```bash
 cargo run --release -- sleep
@@ -114,5 +131,7 @@ cargo run --release -- sleep
 
 1. Hava T. Siegelmann et al., *"Turing universal neural networks do not require global clocks"*, Nature Communications (2026).
 2. Ali Hatamizadeh et al., *"Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention"*, NVIDIA Research (2026).
-3. Leo Feng et al., *"Were RNNs All We Needed?"* (minGRU / minLSTM), (2024).
-4. Xiangning Chen et al., *"Symbolic Discovery of Optimization Algorithms"* (Lion), Google Brain (2023).
+3. Alex Graves, *"Adaptive Computation Time for Recurrent Neural Networks"*, (2016).
+4. Karl Friston, *"The free-energy principle: a unified brain theory?"*, Nature Reviews Neuroscience (2010).
+5. Leo Feng et al., *"Were RNNs All We Needed?"* (minGRU / minLSTM), (2024).
+6. Xiangning Chen et al., *"Symbolic Discovery of Optimization Algorithms"* (Lion), Google Brain (2023).
