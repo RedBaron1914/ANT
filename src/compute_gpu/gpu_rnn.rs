@@ -1364,7 +1364,18 @@ impl GpuAccelerator {
             for batch_idx in 0..b {
                 let gate_energy = self.history.h_gate_energies_cpu[t * b + batch_idx];
                 
-                if gate_energy > 0.5 || local_current_size < 32 {
+                // Cross-Entropy loss for this token is exactly its surprisal: -ln(P(x))
+                let token_surprise = self.history.h_losses[t * b + batch_idx];
+                let delta_s = token_surprise - pipeline.surprise_mean;
+                pipeline.surprise_mean += 0.01 * delta_s;
+                pipeline.surprise_var = (1.0 - 0.01) * pipeline.surprise_var + 0.01 * delta_s * delta_s;
+                let std_dev = pipeline.surprise_var.sqrt().max(0.1);
+                let z_score = (token_surprise - pipeline.surprise_mean) / std_dev;
+
+                let is_meaningful_surprise = z_score >= 0.8 && z_score <= 3.5;
+                let should_write = (gate_energy > pipeline.consolidation_energy && is_meaningful_surprise) || local_current_size < 32;
+
+                if should_write {
                     let mut key = crate::ant_core::tensor::Tensor1D::new(e);
                     let mut val = crate::ant_core::tensor::Tensor1D::new(h);
                     

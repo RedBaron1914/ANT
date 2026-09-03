@@ -249,33 +249,26 @@ impl AntPipeline {
         // Alex Graves' ACT Adaptive Deliberation & Krasnoselskii-Mann Attractor
         let mut h_thought = self.rmsnorm2.forward(&h_2);
         let max_thinking_steps = 4;
-        let mut accumulated_prob = 0.0f32;
 
         for _step in 0..max_thinking_steps {
             let mut deltanet_out = BatchTensor::new(b_size, self.deltanet2.hidden_size);
             self.deltanet2.forward_step_readonly(&h_thought, query_metadata == 1, &mut deltanet_out);
             
+            let mut delta_sq = 0.0f32;
             for b in 0..b_size {
                 for j in 0..self.deltanet2.hidden_size {
                     let prev = h_thought.data.read(b, j);
                     let cand = prev + deltanet_out.data.read(b, j);
+                    let diff = cand - prev;
+                    delta_sq += diff * diff;
                     h_thought.data.write(b, j, prev * 0.5 + cand * 0.5);
                 }
             }
             
-            let mut p_halt_batch = 0.0f32;
-            for b in 0..b_size {
-                let mut dot = self.b_halt;
-                for j in 0..self.deltanet2.hidden_size {
-                    dot += h_thought.data.read(b, j) * self.w_halt.data[j];
-                }
-                let p_halt = 1.0 / (1.0 + (-dot).exp());
-                p_halt_batch += p_halt;
-            }
-            p_halt_batch /= b_size as f32;
-            accumulated_prob += p_halt_batch;
+            let delta = (delta_sq / (b_size * self.deltanet2.hidden_size) as f32).sqrt();
             
-            if accumulated_prob >= 1.0 || p_halt_batch > 0.75 {
+            // If delta < 0.02, the thought has converged to a stable attractor!
+            if delta < 0.02 {
                 break;
             }
         }
@@ -654,5 +647,19 @@ impl AntPipeline {
         }
         
         Ok(())
+    }
+
+    /// Merges trained LoRA adapter deltas into base weights across all layers and resets adapter matrices
+    pub fn merge_lora_into_base(&mut self) {
+        println!("🔄 Merging LoRA adapters into base weights (MemoryAttention + Readout)...");
+        self.memory_attention.w_q.merge_into_base();
+        self.memory_attention.w_fuse.merge_into_base();
+        self.readout.w_proj.merge_into_base();
+        
+        // Sync merged base weights to GPU VRAM if GPU is active
+        if let Some(ref mut gr) = self.gpu_readout {
+            gr.sync_weights_to_gpu(&self.embedding, &self.readout);
+        }
+        println!("✅ LoRA weights successfully fused into base model.");
     }
 }

@@ -211,6 +211,9 @@ enum Commands {
         #[arg(short, long, default_value_t = 10000)]
         capacity: usize,
     },
+
+    /// Fuse trained LoRA adapter deltas into base model weights and reset adapter
+    MergeLora,
 }
 
 #[tokio::main]
@@ -449,6 +452,32 @@ async fn main() {
 
             let _ = std::fs::remove_file(temp_base);
             let _ = std::fs::remove_file(temp_user);
+        }
+
+        Commands::MergeLora => {
+            if !Path::new(&config.training.model_path).exists() {
+                eprintln!("❌ No model found at '{}' to merge.", config.training.model_path);
+                return;
+            }
+            let header = format::AntHeader::read_from_file(&config.training.model_path)
+                .expect("Failed to read .ant header.");
+            let mut pipeline = ant_core::pipeline::AntPipeline::new(
+                &config.memory.base_memory_path,
+                &config.memory.user_memory_path,
+                header.vocab_size as usize, header.embed_dim as usize, header.hidden_size as usize,
+                1,
+                config.memory.base_capacity, config.memory.user_capacity,
+                config.memory.top_k_base, config.memory.top_k_user,
+                config.memory.consolidation_energy,
+                config.session_tape.capacity, config.session_tape.fifo_window,
+                config.continual_learning.lora_rank, config.continual_learning.lora_alpha,
+                config.training.force_cpu,
+            ).unwrap();
+            pipeline.load_weights(&config.training.model_path).unwrap();
+
+            pipeline.merge_lora_into_base();
+            pipeline.save_weights(&config.training.model_path).unwrap();
+            println!("🎉 Merged model checkpoint saved to '{}'.", config.training.model_path);
         }
     }
 }
